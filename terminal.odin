@@ -30,3 +30,13 @@ put_term_rawmode :: proc() {
     case .FAIL: panic("failed to apply raw mode")
     }
 }
+
+enter_alt_mode :: proc() {
+    buf := [?]u8{ESC, '[', '?', '1', '0', '4', '9', 'h'}
+    posix.write(posix.STDOUT_FILENO, raw_data(buf[:]), len(buf))
+}
+
+exit_alt_mode :: proc() {
+    buf := [?]u8{ESC, '[', '?', '1', '0', '4', '9', 'l'}
+    posix.write(posix.STDOUT_FILENO, raw_data(buf[:]), len(buf))
+}
