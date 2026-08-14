@@ -213,7 +213,7 @@ State :: struct {
         // all the styling params applied at once would be 18
         // but leave a room just in case
         params: [30]int, 
-        params_len: int
+        params_len: Maybe(int)
     },
     scroll_region: struct {
         top: int,
@@ -280,7 +280,7 @@ handle_parent :: proc(pid: posix.pid_t, master_fd: posix.FD) {
             invalid = false,
             command = 0,
             params = [30]int{},
-            params_len = 0
+            params_len = nil
         },
         // emit = strings.builder_make(0, 100), // TODO: tweak the number
     }
@@ -393,7 +393,7 @@ consume_csi_sequence :: proc (state: ^State, b: byte) {
     // marker flags: < = > ?
     case 0x3C..=0x3F:
         // if private flag appears after param, the sequence is invalid
-        if state.esc_seq.params[state.esc_seq.params_len] != 0 {
+        if state.esc_seq.params_len != nil {
             state.esc_seq.invalid = true
         } else {
             state.esc_seq.marker = b
@@ -401,11 +401,16 @@ consume_csi_sequence :: proc (state: ^State, b: byte) {
 
     // params
     case 0x30..<COL:
-        state.esc_seq.params[state.esc_seq.params_len] = state.esc_seq.params[state.esc_seq.params_len] * 10 + int(b - ZERO);
+        // if it's the first param, need to assign the correct length
+        len := state.esc_seq.params_len.? or_else 1
+        state.esc_seq.params_len = len
+        state.esc_seq.params[len - 1] = state.esc_seq.params[len - 1] * 10 + int(b - ZERO);
 
     // params separators
     case COL, SEMCOL:
-        state.esc_seq.params_len += 1
+        len := state.esc_seq.params_len.? or_else 1
+        state.esc_seq.params_len = len + 1
+        state.esc_seq.params[len] = 0
 
     // intermediate byte
     case 0x20..=0x2F:
@@ -481,7 +486,7 @@ clear_esc :: proc(state: ^State) {
     state.esc_seq.marker = 0
     state.esc_seq.invalid = false
     state.esc_seq.command = 0
-    state.esc_seq.params_len = 0
+    state.esc_seq.params_len = nil
     mem.zero(&state.esc_seq.params, len(state.esc_seq.params) * size_of(state.esc_seq.params[0]))
 }
 
@@ -854,15 +859,13 @@ handle_csi_sequence :: proc(state: ^State) {
         }
 
         case 'm': {
-            fmt.fprintln(log_file, "Handling styling. Params: %d, %d, %d", state.esc_seq.params[0], state.esc_seq.params[1] ,state.esc_seq.params[2])
+            fmt.fprintfln(log_file, "Handling styling. Params: %d, %d, %d", state.esc_seq.params[0], state.esc_seq.params[1] ,state.esc_seq.params[2])
             i := 0
-            // FIXME: bug is here!
-            // params_len decieve us, because the last param's index usually equals it
-            for i < state.esc_seq.params_len {
+            for i < (state.esc_seq.params_len.? or_else 0) {
                 defer i += 1
                 cell := &state.grid[state.cursor_position.row * state.size.col + state.cursor_position.col]
 
-                fmt.fprintfln(log_file, "Handling int param: %d. Also checking the bold: %d", state.esc_seq.params[i], int(cell_styles.BOLD))
+                fmt.fprintfln(log_file, "Handling int param: %d", state.esc_seq.params[i])
 
                 switch state.esc_seq.params[i] {
                 case 0:
@@ -991,25 +994,32 @@ render_grid :: proc(state: ^State) {
             if cell.styles != {} || cell.fg != nil || cell.bg != nil {
                 // start and end sequence
                 fmt.sbprint(&builder, "\e[")
-                defer fmt.sbprint(&builder, "m")
+                defer {
+                    // replacing trailing ';' separator, which is important
+                    // otherwise the absent value after that equals '0' (which is styles erasing)
+                    switch last_byte := &builder.buf[strings.builder_len(builder) - 1]; last_byte^ {
+                    case ';': last_byte^ = 'm'
+                    case: fmt.sbprint(&builder, "m")
+                    }
+                }
 
                 // emit styles
-                for s in cell.styles do fmt.sbprint(&builder, byte(s))
+                for s in cell.styles do fmt.sbprintf(&builder, "%d;", int(s))
 
                 // emit foreground
                 switch color in cell.fg {
                 case nil: // nothing
                 case int: fmt.sbprint(&builder, color)
-                case PaletteColor: fmt.sbprintf(&builder, "38;5;%d", color.idx)
-                case RgbColor: fmt.sbprintf(&builder, "38;2;%d;%d;%d", color.r, color.g, color.b)
+                case PaletteColor: fmt.sbprintf(&builder, "38;5;%d;", color.idx)
+                case RgbColor: fmt.sbprintf(&builder, "38;2;%d;%d;%d;", color.r, color.g, color.b)
                 }
 
                 // emit background
                 switch color in cell.bg {
                 case nil: // nothing
                 case int: fmt.sbprint(&builder, color)
-                case PaletteColor: fmt.sbprintf(&builder, "48;5;%d", color.idx)
-                case RgbColor: fmt.sbprintf(&builder, "48;2;%d;%d;%d", color.r, color.g, color.b)
+                case PaletteColor: fmt.sbprintf(&builder, "48;5;%d;", color.idx)
+                case RgbColor: fmt.sbprintf(&builder, "48;2;%d;%d;%d;", color.r, color.g, color.b)
                 }
             }
             strings.write_rune(&builder, cell.r)
