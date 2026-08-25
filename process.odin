@@ -230,6 +230,11 @@ State :: struct {
     default_grid: [dynamic]Cell,
     alt_grid: [dynamic]Cell,
     grid: ^[dynamic]Cell,
+    pen: struct {
+        styles: bit_set[cell_styles],
+        fg: Color,
+        bg: Color
+    },
     codes: bit_set[esc_codes],
 }
 
@@ -497,7 +502,14 @@ print_and_advance :: proc(state: ^State, b: byte) {
         scroll_up(state, 1, state.scroll_region.top, state.scroll_region.bottom)
         state.cursor_position.col = 0
     }
-    state.grid[state.cursor_position.row * state.size.col + state.cursor_position.col].r = rune(b)
+
+    cell := &state.grid[state.cursor_position.row * state.size.col + state.cursor_position.col]
+
+    cell.r = rune(b)
+    cell.styles = state.pen.styles
+    cell.fg = state.pen.fg
+    cell.bg = state.pen.bg
+
     state.cursor_position.row += (state.cursor_position.col + 1) / state.size.col
     state.cursor_position.col = (state.cursor_position.col + 1) % state.size.col
     fmt.fprintfln(log_file, "[PA] cursor advanced to: %d, col: %d, %c", state.cursor_position.row, state.cursor_position.col, state.grid[state.cursor_position.row * state.size.col + state.cursor_position.col-1].r)
@@ -861,40 +873,40 @@ handle_csi_sequence :: proc(state: ^State) {
         case 'm': {
             fmt.fprintfln(log_file, "Handling styling. Params: %d, %d, %d", state.esc_seq.params[0], state.esc_seq.params[1] ,state.esc_seq.params[2])
             i := 0
-            for i < (state.esc_seq.params_len.? or_else 0) {
+            for i < (state.esc_seq.params_len.? or_else 1) {
                 defer i += 1
-                cell := &state.grid[state.cursor_position.row * state.size.col + state.cursor_position.col]
+                // cell := &state.grid[state.cursor_position.row * state.size.col + state.cursor_position.col]
 
                 fmt.fprintfln(log_file, "Handling int param: %d", state.esc_seq.params[i])
 
                 switch state.esc_seq.params[i] {
                 case 0:
                     fmt.fprintln(log_file, "Clearing styles")
-                    cell.styles = {}
-                    cell.fg = nil
-                    cell.bg = nil
-                case int(cell_styles.BOLD): cell.styles += { .BOLD }
-                case int(cell_styles.DIM): cell.styles += { .DIM }
-                case 22: cell.styles -= { .BOLD, .DIM }
-                case int(cell_styles.ITALIC): cell.styles += { .ITALIC }
-                case 23: cell.styles -= { .ITALIC }
-                case int(cell_styles.UNDERLINE): cell.styles += { .UNDERLINE }
-                case int(cell_styles.DOUBLE_UNDERLINE): cell.styles += { .DOUBLE_UNDERLINE }
-                case 24: cell.styles -= { .UNDERLINE, .DOUBLE_UNDERLINE }
-                case int(cell_styles.BLINKING): cell.styles += { .BLINKING }
-                case 25: cell.styles -= { .BLINKING }
-                case int(cell_styles.INVERSE): cell.styles += { .INVERSE }
-                case 27: cell.styles -= { .INVERSE }
-                case int(cell_styles.HIDDEN): cell.styles += { .HIDDEN }
-                case 28: cell.styles -= { .HIDDEN }
-                case int(cell_styles.STRIKETHROUGH): cell.styles += { .STRIKETHROUGH }
-                case 29: cell.styles -= { .STRIKETHROUGH }
+                    state.pen.styles = {}
+                    state.pen.fg = nil
+                    state.pen.bg = nil
+                case int(cell_styles.BOLD): state.pen.styles += { .BOLD }
+                case int(cell_styles.DIM): state.pen.styles += { .DIM }
+                case 22: state.pen.styles -= { .BOLD, .DIM }
+                case int(cell_styles.ITALIC): state.pen.styles += { .ITALIC }
+                case 23: state.pen.styles -= { .ITALIC }
+                case int(cell_styles.UNDERLINE): state.pen.styles += { .UNDERLINE }
+                case int(cell_styles.DOUBLE_UNDERLINE): state.pen.styles += { .DOUBLE_UNDERLINE }
+                case 24: state.pen.styles -= { .UNDERLINE, .DOUBLE_UNDERLINE }
+                case int(cell_styles.BLINKING): state.pen.styles += { .BLINKING }
+                case 25: state.pen.styles -= { .BLINKING }
+                case int(cell_styles.INVERSE): state.pen.styles += { .INVERSE }
+                case 27: state.pen.styles -= { .INVERSE }
+                case int(cell_styles.HIDDEN): state.pen.styles += { .HIDDEN }
+                case 28: state.pen.styles -= { .HIDDEN }
+                case int(cell_styles.STRIKETHROUGH): state.pen.styles += { .STRIKETHROUGH }
+                case 29: state.pen.styles -= { .STRIKETHROUGH }
                 // 16-bit foreground
                 case 38: {
-                    switch state.esc_seq.params[i + i] {
+                    switch state.esc_seq.params[i + 1] {
                     // rgb color
                     case 2:
-                        cell.fg = RgbColor{
+                        state.pen.fg = RgbColor{
                             r = state.esc_seq.params[i + 2],
                             g = state.esc_seq.params[i + 3],
                             b = state.esc_seq.params[i + 4],
@@ -903,7 +915,7 @@ handle_csi_sequence :: proc(state: ^State) {
 
                     // 256 colors palette
                     case 5:
-                        cell.fg = PaletteColor{
+                        state.pen.fg = PaletteColor{
                             idx = state.esc_seq.params[i + 2]
                         }
                         i += 2
@@ -913,10 +925,10 @@ handle_csi_sequence :: proc(state: ^State) {
                 }
                 // 16-bit background
                 case 48: {
-                    switch state.esc_seq.params[i + i] {
+                    switch state.esc_seq.params[i + 1] {
                     // rgb color
                     case 2:
-                        cell.bg = RgbColor{
+                        state.pen.bg = RgbColor{
                             r = state.esc_seq.params[i + 2],
                             g = state.esc_seq.params[i + 3],
                             b = state.esc_seq.params[i + 4],
@@ -925,7 +937,7 @@ handle_csi_sequence :: proc(state: ^State) {
 
                     // 256 colors palette
                     case 5:
-                        cell.bg = PaletteColor{
+                        state.pen.bg = PaletteColor{
                             idx = state.esc_seq.params[i + 2]
                         }
                         i += 2
@@ -936,24 +948,26 @@ handle_csi_sequence :: proc(state: ^State) {
                 // foreground
                 case 30..=39, 90..=97: {
                     fmt.fprintfln(log_file, "Simple foreground detected: %d", state.esc_seq.params[i])
-                    cell.fg = state.esc_seq.params[i]
+                    state.pen.fg = state.esc_seq.params[i]
                 }
-                case 40..=49, 100..=107: cell.bg = state.esc_seq.params[i]
+                case 40..=49, 100..=107: {
+                    fmt.fprintfln(log_file, "Simple background detected: %d", state.esc_seq.params[i])
+                    state.pen.bg = state.esc_seq.params[i]
+                }
 
                 case: fmt.fprintfln(log_file, "Unknown color param: %d", state.esc_seq.params[i])
                 }
             }
 
-            cell := &state.grid[state.cursor_position.row * state.size.col + state.cursor_position.col]
-            fmt.fprintf(log_file, "Styles after: %v, fg: ", cell.styles)
-            switch color in cell.fg {
+            fmt.fprintf(log_file, "Styles after: %v, fg: ", state.pen.styles)
+            switch color in state.pen.fg {
             case nil: fmt.fprint(log_file, "null")
             case int: fmt.fprint(log_file, color)
             case PaletteColor: fmt.fprintf(log_file, "38;5;%d", color.idx)
             case RgbColor: fmt.fprintf(log_file, "38;2;%d;%d;%d", color.r, color.g, color.b)
             }
             fmt.fprint(log_file, ", bg: ")
-            switch color in cell.fg {
+            switch color in state.pen.bg {
             case nil: fmt.fprint(log_file, "null")
             case int: fmt.fprint(log_file, color)
             case PaletteColor: fmt.fprintf(log_file, "38;5;%d", color.idx)
@@ -991,6 +1005,7 @@ render_grid :: proc(state: ^State) {
     for r in 0..<state.size.row {
         for c in 0..<state.size.col {
             cell := &state.grid[r * state.size.col + c]
+            // FIXME: for now setting styles for every cell
             if cell.styles != {} || cell.fg != nil || cell.bg != nil {
                 // start and end sequence
                 fmt.sbprint(&builder, "\e[")
@@ -1009,7 +1024,7 @@ render_grid :: proc(state: ^State) {
                 // emit foreground
                 switch color in cell.fg {
                 case nil: // nothing
-                case int: fmt.sbprint(&builder, color)
+                case int: fmt.sbprintf(&builder, "%d;", color)
                 case PaletteColor: fmt.sbprintf(&builder, "38;5;%d;", color.idx)
                 case RgbColor: fmt.sbprintf(&builder, "38;2;%d;%d;%d;", color.r, color.g, color.b)
                 }
@@ -1017,10 +1032,13 @@ render_grid :: proc(state: ^State) {
                 // emit background
                 switch color in cell.bg {
                 case nil: // nothing
-                case int: fmt.sbprint(&builder, color)
+                case int: fmt.sbprintf(&builder, "%d;", color)
                 case PaletteColor: fmt.sbprintf(&builder, "48;5;%d;", color.idx)
                 case RgbColor: fmt.sbprintf(&builder, "48;2;%d;%d;%d;", color.r, color.g, color.b)
                 }
+            } else {
+                // reset styles otherwise
+                fmt.sbprint(&builder, "\e[0m")
             }
             strings.write_rune(&builder, cell.r)
         }
@@ -1072,20 +1090,20 @@ dump_grid :: proc(state: ^State) {
                 for s in cell.styles do append(&buf, byte(s))
 
                 // emit foreground
-                // switch color in cell.fg {
-                // case nil: // nothing
-                // case u16: fmt.sbprint(&builder, color)
-                // case PaletteColor: fmt.sbprintf(&builder, "38;5;%d", color.idx)
-                // case RgbColor: fmt.sbprintf(&builder, "38;2;%d;%d;%d", color.r, color.g, color.b)
-                // }
-                //
-                // // emit background
-                // switch color in cell.bg {
-                // case nil: // nothing
-                // case u16: fmt.sbprint(&builder, color)
-                // case PaletteColor: fmt.sbprintf(&builder, "48;5;%d", color.idx)
-                // case RgbColor: fmt.sbprintf(&builder, "48;2;%d;%d;%d", color.r, color.g, color.b)
-                // }
+                switch color in cell.fg {
+                case nil: // nothing
+                case int: append(&buf, byte(color))
+                case PaletteColor: append(&buf, fmt.tprintf("38;5;%d", color.idx))
+                case RgbColor: append(&buf, fmt.tprintf("38;2;%d;%d;%d", color.r, color.g, color.b))
+                }
+
+                // emit background
+                switch color in cell.bg {
+                case nil: // nothing
+                case int: append(&buf, byte(color))
+                case PaletteColor: append(&buf, fmt.tprintf("48;5;%d", color.idx))
+                case RgbColor: append(&buf, fmt.tprintf("48;2;%d;%d;%d", color.r, color.g, color.b))
+                }
             }
             append(&buf, byte(cell.r))
         }
