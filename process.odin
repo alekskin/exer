@@ -9,8 +9,10 @@ import "core:strings"
 import "base:runtime"
 
 log_file: ^os.File
+@(init)
+create_logfile :: proc "contextless" () {
+    context = runtime.default_context()
 
-create_logfile :: proc() {
     f, err := os.open(
         "/tmp/mux.log",
         os.File_Flags{ .Create, .Write, .Append, .Trunc },
@@ -25,7 +27,6 @@ create_logfile :: proc() {
 
 
 create_child_process :: proc() {
-    create_logfile()
     master_fd := posix.posix_openpt({.RDWR, .NOCTTY})
     assert(master_fd != -1, "Failed to open master PT")
     defer assert(posix.close(master_fd) == .OK, "Failed to close master fd from child")
@@ -100,7 +101,8 @@ cell_styles :: enum {
     DIM = 2,
     ITALIC = 3,
     UNDERLINE = 4,
-    BLINKING = 5,
+    SLOW_BLINK = 5,
+    RAPID_BLINK = 6,
     INVERSE = 7,
     HIDDEN = 8,
     STRIKETHROUGH = 9,
@@ -355,7 +357,7 @@ handle_parent :: proc(pid: posix.pid_t, master_fd: posix.FD) {
                 }
 
                 render_grid(&state)
-                dump_grid(&state)
+                // dump_grid(&state)
             }
 
             case posix.STDIN_FILENO: {
@@ -893,8 +895,9 @@ handle_csi_sequence :: proc(state: ^State) {
                 case int(cell_styles.UNDERLINE): state.pen.styles += { .UNDERLINE }
                 case int(cell_styles.DOUBLE_UNDERLINE): state.pen.styles += { .DOUBLE_UNDERLINE }
                 case 24: state.pen.styles -= { .UNDERLINE, .DOUBLE_UNDERLINE }
-                case int(cell_styles.BLINKING): state.pen.styles += { .BLINKING }
-                case 25: state.pen.styles -= { .BLINKING }
+                case int(cell_styles.SLOW_BLINK): state.pen.styles += { .SLOW_BLINK }
+                case int(cell_styles.RAPID_BLINK): state.pen.styles += { .RAPID_BLINK }
+                case 25: state.pen.styles -= { .SLOW_BLINK, .RAPID_BLINK }
                 case int(cell_styles.INVERSE): state.pen.styles += { .INVERSE }
                 case 27: state.pen.styles -= { .INVERSE }
                 case int(cell_styles.HIDDEN): state.pen.styles += { .HIDDEN }
@@ -906,19 +909,42 @@ handle_csi_sequence :: proc(state: ^State) {
                     switch state.esc_seq.params[i + 1] {
                     // rgb color
                     case 2:
-                        state.pen.fg = RgbColor{
-                            r = state.esc_seq.params[i + 2],
-                            g = state.esc_seq.params[i + 3],
-                            b = state.esc_seq.params[i + 4],
+                        // we do not distinguish the semicolon and colon divided params during parsing
+                        // but the SGR sequence could come as:
+                        // semicolon-divided as '38;2;255;0;0' -- 5 params, correct form
+                        // colon-divided as '38:2::255:0:0' -- 6 params, correct form
+                        // colon divided as '38:2:255:0:0' -- 5 params, incorrect but can occur and we accept it
+                        switch state.esc_seq.params_len {
+                            case 6:
+                                state.pen.fg = RgbColor{
+                                    r = state.esc_seq.params[i + 3],
+                                    g = state.esc_seq.params[i + 4],
+                                    b = state.esc_seq.params[i + 5],
+                                }
+                                i += 5
+
+                            case 5:
+                                state.pen.fg = RgbColor{
+                                    r = state.esc_seq.params[i + 2],
+                                    g = state.esc_seq.params[i + 3],
+                                    b = state.esc_seq.params[i + 4],
+                                }
+                                i += 4
+
+                            case: fmt.fprintfln(log_file, "Unexpected number of params in SGR 38:2 -- %d", state.esc_seq.params_len)
                         }
-                        i += 4
 
                     // 256 colors palette
                     case 5:
-                        state.pen.fg = PaletteColor{
-                            idx = state.esc_seq.params[i + 2]
+                        if state.esc_seq.params_len == 3 {
+                            state.pen.fg = PaletteColor{
+                                idx = state.esc_seq.params[i + 2]
+                            }
+                            i += 2
+                        } else {
+                            i += state.esc_seq.params_len - 1
+                            fmt.fprintfln(log_file, "Unexpected number of params in SGR 38:5 -- %d", state.esc_seq.params_len)
                         }
-                        i += 2
                     
                     case: fmt.fprintfln(log_file, "Unexpected color sequence: 38 > %d", state.esc_seq.params[i + 1])
                     }
@@ -928,19 +954,37 @@ handle_csi_sequence :: proc(state: ^State) {
                     switch state.esc_seq.params[i + 1] {
                     // rgb color
                     case 2:
-                        state.pen.bg = RgbColor{
-                            r = state.esc_seq.params[i + 2],
-                            g = state.esc_seq.params[i + 3],
-                            b = state.esc_seq.params[i + 4],
+                        switch state.esc_seq.params_len {
+                            case 6:
+                                state.pen.bg = RgbColor{
+                                    r = state.esc_seq.params[i + 3],
+                                    g = state.esc_seq.params[i + 4],
+                                    b = state.esc_seq.params[i + 5],
+                                }
+                                i += 5
+
+                            case 5:
+                                state.pen.bg = RgbColor{
+                                    r = state.esc_seq.params[i + 2],
+                                    g = state.esc_seq.params[i + 3],
+                                    b = state.esc_seq.params[i + 4],
+                                }
+                                i += 4
+
+                            case: fmt.fprintfln(log_file, "Unexpected number of params in SGR 48:2 -- %d", state.esc_seq.params_len)
                         }
-                        i += 4
 
                     // 256 colors palette
                     case 5:
-                        state.pen.bg = PaletteColor{
-                            idx = state.esc_seq.params[i + 2]
+                        if state.esc_seq.params_len == 3 {
+                            state.pen.bg = PaletteColor{
+                                idx = state.esc_seq.params[i + 2]
+                            }
+                            i += 2
+                        } else {
+                            i += state.esc_seq.params_len - 1
+                            fmt.fprintfln(log_file, "Unexpected number of params in SGR 48:5 -- %d", state.esc_seq.params_len)
                         }
-                        i += 2
                     
                     case: fmt.fprintfln(log_file, "Unexpected color sequence: 38 > %d", state.esc_seq.params[i + 1])
                     }
