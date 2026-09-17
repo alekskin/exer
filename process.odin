@@ -61,8 +61,25 @@ handle_child :: proc(master_fd: posix.FD, pt_name: cstring) {
     assert(posix.close(master_fd) == .OK, "Failed to close master fd from child")
     assert(posix.close(slave_fd) == .OK, "Failed to close slave fd from child")
 
-    cmd := []cstring{"sh", nil}
-    ret := posix.execvp(cmd[0], raw_data(cmd))
+    cmd: []string
+    for arg, i in os.args[1:] {
+      if arg == "--" {
+          cmd = os.args[1 + i + 1:]
+          break
+      }
+    }
+
+    if len(cmd) == 0 {
+        cmd = {"sh"}
+    }
+
+    argv := make([]cstring, len(cmd) + 1, context.temp_allocator)
+    for arg, i in cmd {
+        argv[i] = strings.clone_to_cstring(arg, context.temp_allocator)
+    }
+    argv[len(cmd)] = nil
+
+    ret := posix.execvp(argv[0], raw_data(argv))
     fmt.panicf("could not execute: %v, %v", ret, posix.strerror(posix.errno()))
 }
 
@@ -100,23 +117,34 @@ cell_styles :: enum {
     BOLD = 1,
     DIM = 2,
     ITALIC = 3,
-    UNDERLINE = 4,
     SLOW_BLINK = 5,
     RAPID_BLINK = 6,
     INVERSE = 7,
     HIDDEN = 8,
     STRIKETHROUGH = 9,
-    DOUBLE_UNDERLINE = 21,
+    FRAMED = 51,
+    ENCIRCLED = 52,
+    OVERLINE = 53
+}
+underline_styles :: enum {
+    SINGLE = 1,
+    DOUBLE = 2,
+    CURLY = 3,
+    DOTTED = 4,
+    DASHED = 5
 }
 
 PaletteColor :: struct { idx: int }
 RgbColor :: struct { r, g, b: int }
 Color :: union { int, PaletteColor, RgbColor }
+UlColor :: union { PaletteColor, RgbColor }
 Cell :: struct {
     r: rune,
     styles: bit_set[cell_styles],
+    ul_style: Maybe(underline_styles),
     fg: Color,
-    bg: Color
+    bg: Color,
+    ul: UlColor // underline color
 }
 
 sequence_type :: enum {
@@ -215,7 +243,17 @@ State :: struct {
         // all the styling params applied at once would be 18
         // but leave a room just in case
         params: [30]int, 
-        params_len: Maybe(int)
+        // the value in bit set represents the separator being:
+        // 0 -- semicolon (;)
+        // 1 -- colon (:)
+        // the position of parameter in esc_seq.params == position of separator
+        // which comes BEFORE the current param
+        // so 0 index will also be 0, because first param does not have previous separator
+        //
+        //  38:2: :r:g:b;4:2;1;2
+        // [ 0,1,1,1,1,1,0,1,0,0]
+        params_sep: bit_set[0..=30; uint],
+        params_len: int
     },
     scroll_region: struct {
         top: int,
@@ -234,8 +272,10 @@ State :: struct {
     grid: ^[dynamic]Cell,
     pen: struct {
         styles: bit_set[cell_styles],
+        ul_style: Maybe(underline_styles),
         fg: Color,
-        bg: Color
+        bg: Color,
+        ul: UlColor
     },
     codes: bit_set[esc_codes],
 }
@@ -287,7 +327,8 @@ handle_parent :: proc(pid: posix.pid_t, master_fd: posix.FD) {
             invalid = false,
             command = 0,
             params = [30]int{},
-            params_len = nil
+            params_len = 0,
+            params_sep = {},
         },
         // emit = strings.builder_make(0, 100), // TODO: tweak the number
     }
@@ -326,7 +367,7 @@ handle_parent :: proc(pid: posix.pid_t, master_fd: posix.FD) {
 
                     if state.esc_seq.status == .NOT_STARTED {
                         pass_control := consume_byte(&state, b)
-                        fmt.fprintfln(log_file, "State after byte consumption. Status = %s, type = %s", state.esc_seq.status, state.esc_seq.type)
+                        // fmt.fprintfln(log_file, "State after byte consumption. Status = %s, type = %s", state.esc_seq.status, state.esc_seq.type)
                         if !pass_control do continue
                     }
 
@@ -357,7 +398,7 @@ handle_parent :: proc(pid: posix.pid_t, master_fd: posix.FD) {
                 }
 
                 render_grid(&state)
-                // dump_grid(&state)
+                dump_grid(&state)
             }
 
             case posix.STDIN_FILENO: {
@@ -400,7 +441,7 @@ consume_csi_sequence :: proc (state: ^State, b: byte) {
     // marker flags: < = > ?
     case 0x3C..=0x3F:
         // if private flag appears after param, the sequence is invalid
-        if state.esc_seq.params_len != nil {
+        if state.esc_seq.params_len > 0 {
             state.esc_seq.invalid = true
         } else {
             state.esc_seq.marker = b
@@ -408,16 +449,14 @@ consume_csi_sequence :: proc (state: ^State, b: byte) {
 
     // params
     case 0x30..<COL:
-        // if it's the first param, need to assign the correct length
-        len := state.esc_seq.params_len.? or_else 1
-        state.esc_seq.params_len = len
-        state.esc_seq.params[len - 1] = state.esc_seq.params[len - 1] * 10 + int(b - ZERO);
+        if state.esc_seq.params_len == 0 do state.esc_seq.params_len += 1
+        state.esc_seq.params[state.esc_seq.params_len - 1] = state.esc_seq.params[state.esc_seq.params_len - 1] * 10 + int(b - ZERO);
 
     // params separators
     case COL, SEMCOL:
-        len := state.esc_seq.params_len.? or_else 1
-        state.esc_seq.params_len = len + 1
-        state.esc_seq.params[len] = 0
+        state.esc_seq.params_len += 1
+        state.esc_seq.params[state.esc_seq.params_len - 1] = 0
+        if b == COL do state.esc_seq.params_sep += {state.esc_seq.params_len - 1}
 
     // intermediate byte
     case 0x20..=0x2F:
@@ -493,7 +532,8 @@ clear_esc :: proc(state: ^State) {
     state.esc_seq.marker = 0
     state.esc_seq.invalid = false
     state.esc_seq.command = 0
-    state.esc_seq.params_len = nil
+    state.esc_seq.params_len = 0
+    state.esc_seq.params_sep = {}
     mem.zero(&state.esc_seq.params, len(state.esc_seq.params) * size_of(state.esc_seq.params[0]))
 }
 
@@ -511,9 +551,15 @@ print_and_advance :: proc(state: ^State, b: byte) {
     cell.styles = state.pen.styles
     cell.fg = state.pen.fg
     cell.bg = state.pen.bg
+    cell.ul_style = state.pen.ul_style
+    cell.ul = state.pen.ul
 
-    state.cursor_position.row += (state.cursor_position.col + 1) / state.size.col
-    state.cursor_position.col = (state.cursor_position.col + 1) % state.size.col
+    state.cursor_position.col += 1
+    if state.cursor_position.col == state.size.col {
+        state.cursor_position.col = 0
+        if state.cursor_position.row < state.size.row - 1 do state.cursor_position.row += 1
+    }
+
     fmt.fprintfln(log_file, "[PA] cursor advanced to: %d, col: %d, %c", state.cursor_position.row, state.cursor_position.col, state.grid[state.cursor_position.row * state.size.col + state.cursor_position.col-1].r)
 }
 
@@ -560,7 +606,7 @@ move_row :: proc(state: ^State, source_row_idx, target_row_idx: int) {
     target_start := target_row_idx * state.size.col
 
     for i in 0..<state.size.col {
-        state.grid[target_start + i].r = state.grid[source_start + i].r
+        state.grid[target_start + i] = state.grid[source_start + i]
     }
 }
 
@@ -571,7 +617,7 @@ clean_row :: proc(state: ^State, row_idx: int) {
     source_start := row_idx * state.size.col
 
     for i in 0..<state.size.col {
-        state.grid[source_start + i].r = WSPACE
+        erase_cell(state, &state.grid[source_start + i])
     }
 }
 
@@ -606,6 +652,15 @@ scroll_up :: proc(state: ^State, rows_count, top_bound, bottom_bound: int) {
     }
 }
 
+erase_cell :: proc(state: ^State, cell: ^Cell, from_pen: bool = true) {
+    cell.r = WSPACE
+    cell.styles = {}
+    cell.bg = state.pen.bg if from_pen == true else nil
+    cell.fg = nil
+    cell.ul = nil
+    cell.ul_style = nil
+}
+
 handle_csi_sequence :: proc(state: ^State) {
     assert(state.esc_seq.type == .CSI, "Attempt to handle non-CSI sequence in CSI handler")
 
@@ -623,7 +678,12 @@ handle_csi_sequence :: proc(state: ^State) {
                 state.modes.private += {m}
                 #partial switch m {
                 case .ALT_SCREEN:
-                    state.grid = &state.alt_grid
+                    if state.grid != &state.alt_grid {
+                        state.grid = &state.alt_grid
+                        for i in 0..<(state.size.row * state.size.col) {
+                            erase_cell(state, &state.alt_grid[i])
+                        }
+                    }
                 case .ORIGIN:
                     state.cursor_position.row = state.scroll_region.top
                     state.cursor_position.col = 1
@@ -723,26 +783,27 @@ handle_csi_sequence :: proc(state: ^State) {
             state.cursor_position.col = min(p0, state.size.col - 1)
         }
         // line erase
+        // keeps current pen's bg
         case 'K': {
             switch state.esc_seq.params[0] {
             // erase from cursor
             case 0: {
                 for i in state.cursor_position.col..=(state.size.col - 1) {
-                    state.grid[(state.cursor_position.row * state.size.col) + i].r = WSPACE
+                    erase_cell(state, &state.grid[(state.cursor_position.row * state.size.col) + i])
                 }
             }
 
             // erase to cursor
             case 1: {
                 for i in 0..=state.cursor_position.col {
-                    state.grid[(state.cursor_position.row * state.size.col) + i].r = WSPACE
+                    erase_cell(state, &state.grid[(state.cursor_position.row * state.size.col) + i])
                 }
             }
 
             // entire line
             case 2: {
                 for i in 0..=(state.size.col - 1) {
-                    state.grid[(state.cursor_position.row * state.size.col) + i].r = WSPACE
+                    erase_cell(state, &state.grid[(state.cursor_position.row * state.size.col) + i])
                 }
             }
 
@@ -751,14 +812,15 @@ handle_csi_sequence :: proc(state: ^State) {
             }
         }
         // erase screen
+        // keeps current pen's bg
         case 'J': {
             switch p := state.esc_seq.params[0]; p {
             // erase from cursor
             case 0: {
                 cell_under_cursor_idx := state.cursor_position.row * state.size.col + state.cursor_position.col
-                last_cell_idx := state.size.row + state.size.col
+                last_cell_idx := state.size.row * state.size.col - 1
                 for i in cell_under_cursor_idx..=last_cell_idx {
-                    state.grid[i].r = WSPACE
+                    erase_cell(state, &state.grid[i])
                 }
             }
 
@@ -766,24 +828,24 @@ handle_csi_sequence :: proc(state: ^State) {
             case 1: {
                 cell_under_cursor_idx := state.cursor_position.row * state.size.col + state.cursor_position.col
                 for i in 0..=cell_under_cursor_idx {
-                    state.grid[i].r = WSPACE
+                    erase_cell(state, &state.grid[i])
                 }
             }
 
             // entire screen
             case 2: {
-                last_cell_idx := state.size.row + state.size.col
+                last_cell_idx := state.size.row * state.size.col - 1
                 for i in 0..=last_cell_idx {
-                    state.grid[i].r = WSPACE
+                    erase_cell(state, &state.grid[i])
                 }
             }
             
             // entire screen and scrollback
             case 3: {
                 // TODO: add scrollback erase
-                last_cell_idx := state.size.row + state.size.col
+                last_cell_idx := state.size.row * state.size.col - 1
                 for i in 0..=last_cell_idx {
-                    state.grid[i].r = WSPACE
+                    erase_cell(state, &state.grid[i])
                 }
             }
 
@@ -792,26 +854,27 @@ handle_csi_sequence :: proc(state: ^State) {
         }
 
         // erase (fill with whitespace) N cells from cursor without shift
-        // preserves only background color
+        // erased keeps current pen's bg
         case 'X': {
             p0 := max(state.esc_seq.params[0], 1)
             end := min(state.cursor_position.col + p0, state.size.col)
 
             for i in state.cursor_position.col..<end {
-                state.grid[(state.cursor_position.row * state.size.col) + i].r = WSPACE
+                erase_cell(state, &state.grid[(state.cursor_position.row * state.size.col) + i])
             }
         }
 
         // inserts N empty cells from the cursor shifting the content
         // content falls of the edge (not wrapped, deleted)
+        // inserted keeps current pen's bg
         case '@': {
             p0 := min(max(state.esc_seq.params[0], 1), state.size.col - (state.cursor_position.col + 1))
             eol := state.cursor_position.row * state.size.col + (state.size.col - 1)
             for i in 0..<p0 {
                 cur_idx := state.cursor_position.row * state.size.col + state.cursor_position.col + i
                 // move current byte to the shifted position
-                state.grid[eol - (p0 - i)].r = state.grid[cur_idx].r
-                state.grid[cur_idx].r = WSPACE
+                state.grid[eol - (p0 - i)] = state.grid[cur_idx]
+                erase_cell(state, &state.grid[cur_idx])
             }
         }
 
@@ -823,10 +886,15 @@ handle_csi_sequence :: proc(state: ^State) {
             for i in 0..<p0 {
                 cur_idx := state.cursor_position.row * state.size.col + state.cursor_position.col + i
                 state.grid[cur_idx].r = state.grid[cur_idx + (p0 - i)].r
+                state.grid[cur_idx].styles = state.grid[cur_idx + (p0 - i)].styles
+                state.grid[cur_idx].fg = state.grid[cur_idx + (p0 - i)].fg
+                state.grid[cur_idx].bg = state.grid[cur_idx + (p0 - i)].bg
+                state.grid[cur_idx].ul = state.grid[cur_idx + (p0 - i)].ul
+                state.grid[cur_idx].ul_style = state.grid[cur_idx + (p0 - i)].ul_style
             }
             // erase rest
             for i in 0..<p0 {
-                state.grid[eol - i].r = WSPACE
+                erase_cell(state, &state.grid[eol - i])
             }
         }
 
@@ -875,9 +943,8 @@ handle_csi_sequence :: proc(state: ^State) {
         case 'm': {
             fmt.fprintfln(log_file, "Handling styling. Params: %d, %d, %d", state.esc_seq.params[0], state.esc_seq.params[1] ,state.esc_seq.params[2])
             i := 0
-            for i < (state.esc_seq.params_len.? or_else 1) {
+            p_loop: for i < state.esc_seq.params_len {
                 defer i += 1
-                // cell := &state.grid[state.cursor_position.row * state.size.col + state.cursor_position.col]
 
                 fmt.fprintfln(log_file, "Handling int param: %d", state.esc_seq.params[i])
 
@@ -885,16 +952,41 @@ handle_csi_sequence :: proc(state: ^State) {
                 case 0:
                     fmt.fprintln(log_file, "Clearing styles")
                     state.pen.styles = {}
+                    state.pen.ul_style = nil
+                    state.pen.ul = nil
                     state.pen.fg = nil
                     state.pen.bg = nil
+
                 case int(cell_styles.BOLD): state.pen.styles += { .BOLD }
                 case int(cell_styles.DIM): state.pen.styles += { .DIM }
                 case 22: state.pen.styles -= { .BOLD, .DIM }
+                case 20: // fraktur, no-op
                 case int(cell_styles.ITALIC): state.pen.styles += { .ITALIC }
                 case 23: state.pen.styles -= { .ITALIC }
-                case int(cell_styles.UNDERLINE): state.pen.styles += { .UNDERLINE }
-                case int(cell_styles.DOUBLE_UNDERLINE): state.pen.styles += { .DOUBLE_UNDERLINE }
-                case 24: state.pen.styles -= { .UNDERLINE, .DOUBLE_UNDERLINE }
+                // UNDERLINE
+                case 4: {
+                    state.pen.ul_style = .SINGLE
+                    // if next param was divided by colon
+                    // that means it's underline styling
+                    if (i + 1 in state.esc_seq.params_sep) {
+                        switch state.esc_seq.params[i + 1] {
+                            case 0: state.pen.ul_style = nil
+                            case 1: state.pen.ul_style = .SINGLE
+                            case 2: state.pen.ul_style = .DOUBLE
+                            case 3: state.pen.ul_style = .CURLY
+                            case 4: state.pen.ul_style = .DOTTED
+                            case 5: state.pen.ul_style = .DASHED
+                            case: state.pen.ul_style = nil
+                        }
+                        i += 1
+                    }
+                }
+                // double underline sequence is quite non-standard ('ESC[21m')
+                // we consume it, but emit more standard 'ESC[4:2m' instead
+                case 21:
+                    state.pen.ul_style = .DOUBLE
+                case 24:
+                    state.pen.ul_style = nil
                 case int(cell_styles.SLOW_BLINK): state.pen.styles += { .SLOW_BLINK }
                 case int(cell_styles.RAPID_BLINK): state.pen.styles += { .RAPID_BLINK }
                 case 25: state.pen.styles -= { .SLOW_BLINK, .RAPID_BLINK }
@@ -904,25 +996,26 @@ handle_csi_sequence :: proc(state: ^State) {
                 case 28: state.pen.styles -= { .HIDDEN }
                 case int(cell_styles.STRIKETHROUGH): state.pen.styles += { .STRIKETHROUGH }
                 case 29: state.pen.styles -= { .STRIKETHROUGH }
+                case int(cell_styles.FRAMED): state.pen.styles += { .FRAMED }
+                case int(cell_styles.ENCIRCLED): state.pen.styles += { .ENCIRCLED }
+                case 54: state.pen.styles -= { .FRAMED, .ENCIRCLED }
+                case int(cell_styles.OVERLINE): state.pen.styles += { .OVERLINE }
+                case 55: state.pen.styles -= { .OVERLINE }
+
                 // 16-bit foreground
                 case 38: {
-                    switch state.esc_seq.params[i + 1] {
-                    // rgb color
-                    case 2:
-                        // we do not distinguish the semicolon and colon divided params during parsing
-                        // but the SGR sequence could come as:
-                        // semicolon-divided as '38;2;255;0;0' -- 5 params, correct form
-                        // colon-divided as '38:2::255:0:0' -- 6 params, correct form
-                        // colon divided as '38:2:255:0:0' -- 5 params, incorrect but can occur and we accept it
-                        switch state.esc_seq.params_len {
-                            case 6:
-                                state.pen.fg = RgbColor{
-                                    r = state.esc_seq.params[i + 3],
-                                    g = state.esc_seq.params[i + 4],
-                                    b = state.esc_seq.params[i + 5],
-                                }
-                                i += 5
+                    // count the subparams (separated by colom, e.g. '38:2::r:g:b'
+                    subparams_len := 1
+                    for (i + subparams_len in state.esc_seq.params_sep) do subparams_len += 1
 
+                    // subparams has more formatting options
+                    if subparams_len > 1 {
+                        fg_subparams: switch state.esc_seq.params[i + 1] {
+                        case 2:
+                            switch subparams_len {
+                            case 0..<5: break fg_subparams
+
+                            // 38:2:r:g:b -- 5 params, incorrect but can occur and we accept it
                             case 5:
                                 state.pen.fg = RgbColor{
                                     r = state.esc_seq.params[i + 2],
@@ -931,38 +1024,109 @@ handle_csi_sequence :: proc(state: ^State) {
                                 }
                                 i += 4
 
-                            case: fmt.fprintfln(log_file, "Unexpected number of params in SGR 38:2 -- %d", state.esc_seq.params_len)
-                        }
-
-                    // 256 colors palette
-                    case 5:
-                        if state.esc_seq.params_len == 3 {
-                            state.pen.fg = PaletteColor{
-                                idx = state.esc_seq.params[i + 2]
+                            // 38:2::r:g:b -- 6 params, correct form
+                            // 38:2:r:g:b:tol -- 6 params, no cs but with tolerance
+                            // 38:2::r:g:b:tol -- 7 params with tolrance
+                            // 38:2::r:g:b:tolcs -- 8 params, with cs, tolerance and its colorspace
+                            // the 'tol' and 'tolcs' are always skipped
+                            // 
+                            // when ambiguous, always fallback to as 'cs:r:g:b'
+                            case:
+                                state.pen.fg = RgbColor{
+                                    r = state.esc_seq.params[i + 3],
+                                    g = state.esc_seq.params[i + 4],
+                                    b = state.esc_seq.params[i + 5],
+                                }
+                                i += subparams_len - 1
                             }
-                            i += 2
-                        } else {
-                            i += state.esc_seq.params_len - 1
-                            fmt.fprintfln(log_file, "Unexpected number of params in SGR 38:5 -- %d", state.esc_seq.params_len)
+
+
+                        case 3:
+                            switch subparams_len {
+                            case 0..<5: break fg_subparams
+                            // 38:3:c:m:y
+                            // 38:2::c:m:y
+                            // skip it as virtually non-supported
+                            case 5: i += 4
+                            case 6: i += 5
+
+                            case:
+                                fmt.fprintfln(log_file, "Unexpected number of params in SGR 38:3 -- %d", subparams_len)
+                            }
+                        
+                        case 4:
+                            switch subparams_len {
+                            case 0..<6: break fg_subparams
+                            // 38:2:c:m:y:k -- 6 params, cmyk, incorrect but we accept it
+                            // 38:2::c:m:y:k -- 7 params, cmyk, correct form
+                            // skip it as virtually non-supported
+                            case 6: i += 5
+                            case 7: i += 5
+                            case:
+                                fmt.fprintfln(log_file, "Unexpected number of params in SGR 38:4 -- %d", subparams_len)
+                            }
+
+                        case 5:
+                            switch subparams_len {
+                            case 0..<3: break fg_subparams
+                            case 3:
+                                state.pen.fg = PaletteColor{
+                                    idx = state.esc_seq.params[i + 2]
+                                }
+                                i += 2
+                            case:
+                                fmt.fprintfln(log_file, "Unexpected number of params in SGR 38:5 -- %d", subparams_len)
+                            }
                         }
-                    
-                    case: fmt.fprintfln(log_file, "Unexpected color sequence: 38 > %d", state.esc_seq.params[i + 1])
+                    } else {
+                        switch state.esc_seq.params[i + 1] {
+                        // rgb
+                        case 2:
+                            // there should be enough params left to peek
+                            // otherwise just stop parsing params
+                            if state.esc_seq.params_len - i >= 5 {
+                                state.pen.fg = RgbColor{
+                                    r = state.esc_seq.params[i + 2],
+                                    g = state.esc_seq.params[i + 3],
+                                    b = state.esc_seq.params[i + 4],
+                                }
+                                i += 4
+                            } else {
+                                fmt.fprintfln(log_file, "Unexpected number of params in SGR 38:2 -- %d", state.esc_seq.params_len)
+                                break p_loop
+                            }
+
+                        // 256 colors palette
+                        case 5:
+                            if state.esc_seq.params_len - i >= 3 {
+                                state.pen.fg = PaletteColor{
+                                    idx = state.esc_seq.params[i + 2]
+                                }
+                                i += 2
+                            } else {
+                                fmt.fprintfln(log_file, "Unexpected number of params in SGR 38:5 -- %d", state.esc_seq.params_len)
+                                break p_loop
+                            }
+                        
+                        case:
+                            fmt.fprintfln(log_file, "Unexpected color sequence: 38 > %d", state.esc_seq.params[i + 1])
+                        }
                     }
                 }
                 // 16-bit background
                 case 48: {
-                    switch state.esc_seq.params[i + 1] {
-                    // rgb color
-                    case 2:
-                        switch state.esc_seq.params_len {
-                            case 6:
-                                state.pen.bg = RgbColor{
-                                    r = state.esc_seq.params[i + 3],
-                                    g = state.esc_seq.params[i + 4],
-                                    b = state.esc_seq.params[i + 5],
-                                }
-                                i += 5
+                    // count the subparams (separated by colom, e.g. '48:2::r:g:b'
+                    subparams_len := 1
+                    for (i + subparams_len in state.esc_seq.params_sep) do subparams_len += 1
 
+                    // subparams has more formatting options
+                    if subparams_len > 1 {
+                        bg_subparams: switch state.esc_seq.params[i + 1] {
+                        case 2:
+                            switch subparams_len {
+                            case 0..<5: break bg_subparams
+
+                            // 48:2:r:g:b -- 5 params, incorrect but can occur and we accept it
                             case 5:
                                 state.pen.bg = RgbColor{
                                     r = state.esc_seq.params[i + 2],
@@ -971,30 +1135,197 @@ handle_csi_sequence :: proc(state: ^State) {
                                 }
                                 i += 4
 
-                            case: fmt.fprintfln(log_file, "Unexpected number of params in SGR 48:2 -- %d", state.esc_seq.params_len)
-                        }
-
-                    // 256 colors palette
-                    case 5:
-                        if state.esc_seq.params_len == 3 {
-                            state.pen.bg = PaletteColor{
-                                idx = state.esc_seq.params[i + 2]
+                            // 48:2::r:g:b -- 6 params, correct form
+                            // 48:2:r:g:b:tol -- 6 params, no cs but with tolerance
+                            // 48:2::r:g:b:tol -- 7 params with tolrance
+                            // 48:2::r:g:b:tolcs -- 8 params, with cs, tolerance and its colorspace
+                            // the 'tol' and 'tolcs' are always skipped
+                            // 
+                            // when ambiguous, always fallback to as 'cs:r:g:b'
+                            case:
+                                state.pen.bg = RgbColor{
+                                    r = state.esc_seq.params[i + 3],
+                                    g = state.esc_seq.params[i + 4],
+                                    b = state.esc_seq.params[i + 5],
+                                }
+                                i += subparams_len - 1
                             }
-                            i += 2
-                        } else {
-                            i += state.esc_seq.params_len - 1
-                            fmt.fprintfln(log_file, "Unexpected number of params in SGR 48:5 -- %d", state.esc_seq.params_len)
+
+
+                        case 3:
+                            switch subparams_len {
+                            case 0..<5: break bg_subparams
+
+                            // 48:3:c:m:y -- 5 params, incorrect but can occur and we accept it
+                            // 48:2::c:m:y -- 6 params, correct form
+                            // skip it as virtually non-supported
+                            case 5: i += 4
+                            case 6: i += 5
+
+                            case:
+                                fmt.fprintfln(log_file, "Unexpected number of params in SGR 48:3 -- %d", subparams_len)
+                            }
+                        
+                        case 4:
+                            switch subparams_len {
+                            case 0..<6: break bg_subparams
+
+                            // 48:2:c:m:y:k -- 6 params, cmyk, incorrect but we accept it
+                            // 48:2::c:m:y:k -- 7 params, cmyk, correct form
+                            case 6: i += 5
+                            case 7: i += 5
+
+                            case:
+                                fmt.fprintfln(log_file, "Unexpected number of params in SGR 48:4 -- %d", subparams_len)
+                            }
+
+                        case 5:
+                            switch subparams_len {
+                            case 0..<3: break bg_subparams
+                            case 3:
+                                state.pen.bg = PaletteColor{
+                                    idx = state.esc_seq.params[i + 2]
+                                }
+                                i += 2
+                            case:
+                                fmt.fprintfln(log_file, "Unexpected number of params in SGR 48:5 -- %d", subparams_len)
+                            }
                         }
-                    
-                    case: fmt.fprintfln(log_file, "Unexpected color sequence: 38 > %d", state.esc_seq.params[i + 1])
+                    } else {
+                        switch state.esc_seq.params[i + 1] {
+                        // rgb
+                        case 2:
+                            // there should be enough params left to peek
+                            // otherwise just stop parsing params
+                            if state.esc_seq.params_len - i >= 5 {
+                                state.pen.bg = RgbColor{
+                                    r = state.esc_seq.params[i + 2],
+                                    g = state.esc_seq.params[i + 3],
+                                    b = state.esc_seq.params[i + 4],
+                                }
+                                i += 4
+                            } else {
+                                fmt.fprintfln(log_file, "Unexpected number of params in SGR 48:2 -- %d", state.esc_seq.params_len)
+                                break p_loop
+                            }
+
+                        // 256 colors palette
+                        case 5:
+                            if state.esc_seq.params_len - i >= 3 {
+                                state.pen.bg = PaletteColor{
+                                    idx = state.esc_seq.params[i + 2]
+                                }
+                                i += 2
+                            } else {
+                                fmt.fprintfln(log_file, "Unexpected number of params in SGR 48:5 -- %d", state.esc_seq.params_len)
+                                break p_loop
+                            }
+                        
+                        case:
+                            fmt.fprintfln(log_file, "Unexpected color sequence: 48 > %d", state.esc_seq.params[i + 1])
+                        }
                     }
                 }
+                // default foreground
+                case 39: state.pen.fg = nil
+                // default background
+                case 49: state.pen.bg = nil
+                // proportional spacing / cancellation
+                case 26, 50: // no-op
+
+                // underline color
+                case 58: {
+                    // count the subparams (separated by colom, e.g. '58:2::r:g:b'
+                    subparams_len := 1
+                    for (i + subparams_len in state.esc_seq.params_sep) do subparams_len += 1
+
+                    // subparams has more formatting options
+                    if subparams_len > 1 {
+                        ul_subparams: switch state.esc_seq.params[i + 1] {
+                        case 2:
+                            switch subparams_len {
+                            case 0..<5: break ul_subparams
+
+                            // 58:2:r:g:b -- 5 params, incorrect but can occur and we accept it
+                            case 5:
+                                state.pen.ul = RgbColor{
+                                    r = state.esc_seq.params[i + 2],
+                                    g = state.esc_seq.params[i + 3],
+                                    b = state.esc_seq.params[i + 4],
+                                }
+                                i += 4
+
+                            // 48:2::r:g:b -- 6 params, correct form
+                            case:
+                                state.pen.ul = RgbColor{
+                                    r = state.esc_seq.params[i + 3],
+                                    g = state.esc_seq.params[i + 4],
+                                    b = state.esc_seq.params[i + 5],
+                                }
+                                i += 5
+                            }
+
+                        case 5:
+                            switch subparams_len {
+                            case 0..<3: break ul_subparams
+                            case 3:
+                                state.pen.ul = PaletteColor{
+                                    idx = state.esc_seq.params[i + 2]
+                                }
+                                i += 2
+                            case:
+                                fmt.fprintfln(log_file, "Unexpected number of params in SGR 48:5 -- %d", subparams_len)
+                            }
+                        }
+                    } else {
+                        switch state.esc_seq.params[i + 1] {
+                        // rgb
+                        case 2:
+                            // there should be enough params left to peek
+                            // otherwise just stop parsing params
+                            if state.esc_seq.params_len - i >= 5 {
+                                state.pen.ul = RgbColor{
+                                    r = state.esc_seq.params[i + 2],
+                                    g = state.esc_seq.params[i + 3],
+                                    b = state.esc_seq.params[i + 4],
+                                }
+                                i += 4
+                            } else {
+                                fmt.fprintfln(log_file, "Unexpected number of params in SGR 48:2 -- %d", state.esc_seq.params_len)
+                                break p_loop
+                            }
+
+                        // 256 colors palette
+                        case 5:
+                            if state.esc_seq.params_len - i >= 3 {
+                                state.pen.ul = PaletteColor{
+                                    idx = state.esc_seq.params[i + 2]
+                                }
+                                i += 2
+                            } else {
+                                fmt.fprintfln(log_file, "Unexpected number of params in SGR 48:5 -- %d", state.esc_seq.params_len)
+                                break p_loop
+                            }
+                        
+                        case:
+                            fmt.fprintfln(log_file, "Unexpected color sequence: 48 > %d", state.esc_seq.params[i + 1])
+                        }
+                    }
+                }
+
+                // default underline color
+                case 59: state.pen.ul = nil
+
+                // ideogram attributes. virtually unsupported
+                case 60..=65: // no-op
+
                 // foreground
-                case 30..=39, 90..=97: {
+                case 30..=37, 90..=97: {
                     fmt.fprintfln(log_file, "Simple foreground detected: %d", state.esc_seq.params[i])
                     state.pen.fg = state.esc_seq.params[i]
                 }
-                case 40..=49, 100..=107: {
+                // background
+                case 40..=47, 100..=107: {
                     fmt.fprintfln(log_file, "Simple background detected: %d", state.esc_seq.params[i])
                     state.pen.bg = state.esc_seq.params[i]
                 }
@@ -1007,15 +1338,15 @@ handle_csi_sequence :: proc(state: ^State) {
             switch color in state.pen.fg {
             case nil: fmt.fprint(log_file, "null")
             case int: fmt.fprint(log_file, color)
-            case PaletteColor: fmt.fprintf(log_file, "38;5;%d", color.idx)
-            case RgbColor: fmt.fprintf(log_file, "38;2;%d;%d;%d", color.r, color.g, color.b)
+            case PaletteColor: fmt.fprintf(log_file, "38:5:%d", color.idx)
+            case RgbColor: fmt.fprintf(log_file, "38:2:%d:%d:%d", color.r, color.g, color.b)
             }
             fmt.fprint(log_file, ", bg: ")
             switch color in state.pen.bg {
             case nil: fmt.fprint(log_file, "null")
             case int: fmt.fprint(log_file, color)
-            case PaletteColor: fmt.fprintf(log_file, "38;5;%d", color.idx)
-            case RgbColor: fmt.fprintf(log_file, "38;2;%d;%d;%d", color.r, color.g, color.b)
+            case PaletteColor: fmt.fprintf(log_file, "48:5:%d", color.idx)
+            case RgbColor: fmt.fprintf(log_file, "48:2:%d:%d:%d", color.r, color.g, color.b)
             }
             fmt.fprint(log_file, "\n")
         }
@@ -1050,11 +1381,13 @@ render_grid :: proc(state: ^State) {
         for c in 0..<state.size.col {
             cell := &state.grid[r * state.size.col + c]
             // FIXME: for now setting styles for every cell
-            if cell.styles != {} || cell.fg != nil || cell.bg != nil {
+            if cell.styles != {} || cell.fg != nil || cell.bg != nil || cell.ul_style != nil || cell.ul != nil {
                 // start and end sequence
                 fmt.sbprint(&builder, "\e[")
                 defer {
-                    // replacing trailing ';' separator, which is important
+                    // each param below always prints trailing separator (;) for simplicity
+                    //
+                    // replacing trailing ';' separator here, which is important
                     // otherwise the absent value after that equals '0' (which is styles erasing)
                     switch last_byte := &builder.buf[strings.builder_len(builder) - 1]; last_byte^ {
                     case ';': last_byte^ = 'm'
@@ -1064,21 +1397,32 @@ render_grid :: proc(state: ^State) {
 
                 // emit styles
                 for s in cell.styles do fmt.sbprintf(&builder, "%d;", int(s))
+                switch cell.ul_style {
+                case .SINGLE:
+                    fmt.sbprint(&builder, "4;")
+                case .DOUBLE, .CURLY, .DOTTED, .DASHED:
+                    fmt.sbprintf(&builder, "4:%d;", int(cell.ul_style.(underline_styles)))
+                }
+                switch color in cell.ul {
+                case nil: // default
+                case PaletteColor: fmt.sbprintf(&builder, "58:5:%d;", color.idx)
+                case RgbColor: fmt.sbprintf(&builder, "58:2::%d:%d:%d;", color.r, color.g, color.b)
+                }
 
                 // emit foreground
                 switch color in cell.fg {
-                case nil: // nothing
+                case nil: // default
                 case int: fmt.sbprintf(&builder, "%d;", color)
-                case PaletteColor: fmt.sbprintf(&builder, "38;5;%d;", color.idx)
-                case RgbColor: fmt.sbprintf(&builder, "38;2;%d;%d;%d;", color.r, color.g, color.b)
+                case PaletteColor: fmt.sbprintf(&builder, "38:5:%d;", color.idx)
+                case RgbColor: fmt.sbprintf(&builder, "38:2::%d:%d:%d;", color.r, color.g, color.b)
                 }
 
                 // emit background
                 switch color in cell.bg {
-                case nil: // nothing
+                case nil: // default
                 case int: fmt.sbprintf(&builder, "%d;", color)
-                case PaletteColor: fmt.sbprintf(&builder, "48;5;%d;", color.idx)
-                case RgbColor: fmt.sbprintf(&builder, "48;2;%d;%d;%d;", color.r, color.g, color.b)
+                case PaletteColor: fmt.sbprintf(&builder, "48:5:%d;", color.idx)
+                case RgbColor: fmt.sbprintf(&builder, "48:2::%d:%d:%d;", color.r, color.g, color.b)
                 }
             } else {
                 // reset styles otherwise
@@ -1137,16 +1481,16 @@ dump_grid :: proc(state: ^State) {
                 switch color in cell.fg {
                 case nil: // nothing
                 case int: append(&buf, byte(color))
-                case PaletteColor: append(&buf, fmt.tprintf("38;5;%d", color.idx))
-                case RgbColor: append(&buf, fmt.tprintf("38;2;%d;%d;%d", color.r, color.g, color.b))
+                case PaletteColor: append(&buf, fmt.tprintf("38:5:%d;", color.idx))
+                case RgbColor: append(&buf, fmt.tprintf("38:2::%d:%d:%d;", color.r, color.g, color.b))
                 }
 
                 // emit background
                 switch color in cell.bg {
                 case nil: // nothing
                 case int: append(&buf, byte(color))
-                case PaletteColor: append(&buf, fmt.tprintf("48;5;%d", color.idx))
-                case RgbColor: append(&buf, fmt.tprintf("48;2;%d;%d;%d", color.r, color.g, color.b))
+                case PaletteColor: append(&buf, fmt.tprintf("48:5:%d;", color.idx))
+                case RgbColor: append(&buf, fmt.tprintf("48:2:%d:%d:%d;", color.r, color.g, color.b))
                 }
             }
             append(&buf, byte(cell.r))
